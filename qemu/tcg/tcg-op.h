@@ -28,7 +28,6 @@
 
 /* Basic output routines.  Not for general consumption.  */
 
-void tcg_gen_op0(TCGContext *, TCGOpcode);
 void tcg_gen_op1(TCGContext *, TCGOpcode, TCGArg);
 void tcg_gen_op2(TCGContext *, TCGOpcode, TCGArg, TCGArg);
 void tcg_gen_op3(TCGContext *, TCGOpcode, TCGArg, TCGArg, TCGArg);
@@ -260,7 +259,7 @@ static inline void tcg_gen_op6ii_i64(TCGContext *tcg_ctx,TCGOpcode opc, TCGv_i64
 
 /* Generic ops.  */
 
-int gen_new_label(void);
+TCGLabel * gen_new_label(TCGContext *tcg_ctx);
 
 static inline void gen_set_label(TCGContext *tcg_ctx,int n)
 {

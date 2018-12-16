@@ -170,7 +170,8 @@ typedef struct TCGRelocation {
 } TCGRelocation; 
 
 typedef struct TCGLabel {
-    int has_value;
+    unsigned has_value : 1;
+    unsigned id : 31;
     union {
         uintptr_t value;
         tcg_insn_unit *value_ptr;
@@ -185,8 +186,6 @@ typedef struct TCGPool {
 } TCGPool;
 
 #define TCG_POOL_CHUNK_SIZE 32768
-
-#define TCG_MAX_LABELS 512
 
 #define TCG_MAX_TEMPS 512
 
@@ -421,20 +420,19 @@ static inline TCGCond tcg_high_cond(TCGCond c)
     }
 }
 
-#define TEMP_VAL_DEAD  0
-#define TEMP_VAL_REG   1
-#define TEMP_VAL_MEM   2
-#define TEMP_VAL_CONST 3
+typedef enum TCGTempVal {
+    TEMP_VAL_DEAD,
+    TEMP_VAL_REG,
+    TEMP_VAL_MEM,
+    TEMP_VAL_CONST,
+} TCGTempVal;
 
-/* XXX: optimize memory layout */
 typedef struct TCGTemp {
-    TCGType base_type;
-    TCGType type;
-    int val_type;
-    int reg;
-    tcg_target_long val;
-    int mem_reg;
-    intptr_t mem_offset;
+    unsigned int reg:8;
+    unsigned int mem_reg:8;
+    TCGTempVal val_type:8;
+    TCGType base_type:8;
+    TCGType type:8;
     unsigned int fixed_reg:1;
     unsigned int mem_coherent:1;
     unsigned int mem_allocated:1;
@@ -442,6 +440,9 @@ typedef struct TCGTemp {
                                   basic blocks. Otherwise, it is not
                                   preserved across basic blocks. */
     unsigned int temp_allocated:1; /* never used for code gen */
+
+    tcg_target_long val;
+    intptr_t mem_offset;
     const char *name;
 } TCGTemp;
 
@@ -478,7 +479,6 @@ void tcg_pool_reset(TCGContext *s);
 void tcg_pool_delete(TCGContext *s);
 
 void tcg_context_init(TCGContext *s);
-void tcg_context_free(void *s);   // free memory allocated for @s
 void tcg_prologue_init(TCGContext *s);
 void tcg_func_start(TCGContext *s);
 
@@ -862,6 +862,32 @@ TCGv_i32 tcg_const_i32(TCGContext *s, int32_t val);
 TCGv_i64 tcg_const_i64(TCGContext *s, int64_t val);
 TCGv_i32 tcg_const_local_i32(TCGContext *s, int32_t val);
 TCGv_i64 tcg_const_local_i64(TCGContext *s, int64_t val);
+TCGLabel *gen_new_label(TCGContext *s);
+
+/**
+ * label_arg
+ * @l: label
+ *
+ * Encode a label for storage in the TCG opcode stream.
+ */
+
+static inline TCGArg label_arg(TCGLabel *l)
+{
+    return (uintptr_t)l;
+}
+
+/**
+ * arg_label
+ * @i: value
+ *
+ * The opposite of label_arg.  Retrieve a label from the
+ * encoding of the TCG opcode stream.
+ */
+
+static inline TCGLabel *arg_label(TCGArg i)
+{
+    return (TCGLabel *)(uintptr_t)i;
+}
 
 /**
  * tcg_ptr_byte_diff
@@ -909,14 +935,41 @@ static inline size_t tcg_current_code_size(TCGContext *s)
 }
 
 /* The number of opcodes emitted so far.  */
-static inline int tcg_op_buf_count(TCGContext *tcg_ctx)
+typedef uint32_t TCGMemOpIdx;
+
+/**
+ * make_memop_idx
+ * @op: memory operation
+ * @idx: mmu index
+ *
+ * Encode these values into a single parameter.
+ */
+static inline TCGMemOpIdx make_memop_idx(TCGMemOp op, unsigned idx)
 {
-	return tcg_ctx->gen_next_op_idx;
+    tcg_debug_assert(idx <= 15);
+    return (op << 4) | idx;
 }
 
-static inline bool tcg_op_buf_full(TCGContext *tcg_ctx)
+/**
+ * get_memop
+ * @oi: combined op/idx parameter
+ *
+ * Extract the memory operation from the combined value.
+ */
+static inline TCGMemOp get_memop(TCGMemOpIdx oi)
 {
-	return tcg_op_buf_count(tcg_ctx) >= OPC_MAX_SIZE;
+    return oi >> 4;
+}
+
+/**
+ * get_mmuidx
+ * @oi: combined op/idx parameter
+ *
+ * Extract the mmu index from the combined value.
+ */
+static inline unsigned get_mmuidx(TCGMemOpIdx oi)
+{
+    return oi & 15;
 }
 
 /**
@@ -1039,8 +1092,6 @@ void helper_be_stq_mmu(CPUArchState *env, target_ulong addr, uint64_t val,
 # define helper_ret_stl_mmu   helper_le_stl_mmu
 # define helper_ret_stq_mmu   helper_le_stq_mmu
 #endif
-
-void check_exit_request(TCGContext *tcg_ctx);
 
 #endif /* CONFIG_SOFTMMU */
 

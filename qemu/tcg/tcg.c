@@ -110,11 +110,15 @@ static void tcg_out_tb_init(TCGContext *s);
 static void tcg_out_tb_finalize(TCGContext *s);
 
 
-TCGOpDef tcg_op_defs_org[] = {
+TCGOpDef tcg_op_defs[] = {
 #define DEF(s, oargs, iargs, cargs, flags) { #s, oargs, iargs, cargs, iargs + oargs + cargs, flags },
 #include "tcg-opc.h"
 #undef DEF
 };
+const size_t tcg_op_defs_max = ARRAY_SIZE(tcg_op_defs);
+
+static TCGRegSet tcg_target_available_regs[2];
+static TCGRegSet tcg_target_call_clobber_regs;
 
 #if TCG_TARGET_INSN_UNIT_SIZE == 1
 static QEMU_UNUSED_FUNC inline void tcg_out8(TCGContext *s, uint8_t v)
@@ -201,12 +205,10 @@ static QEMU_UNUSED_FUNC inline void tcg_patch64(tcg_insn_unit *p,
 /* label relocation processing */
 
 static void tcg_out_reloc(TCGContext *s, tcg_insn_unit *code_ptr, int type,
-                          int label_index, intptr_t addend)
+                          TCGLabel *l, intptr_t addend)
 {
-    TCGLabel *l;
     TCGRelocation *r;
 
-    l = &s->labels[label_index];
     if (l->has_value) {
         /* FIXME: This may break relocations on RISC targets that
            modify instruction fields in place.  The caller may not have
@@ -223,9 +225,8 @@ static void tcg_out_reloc(TCGContext *s, tcg_insn_unit *code_ptr, int type,
     }
 }
 
-static void tcg_out_label(TCGContext *s, int label_index, tcg_insn_unit *ptr)
+static void tcg_out_label(TCGContext *s, TCGLabel *l, tcg_insn_unit *ptr)
 {
-    TCGLabel *l = &s->labels[label_index];
     intptr_t value = (intptr_t)ptr;
     TCGRelocation *r;
 
@@ -239,18 +240,15 @@ static void tcg_out_label(TCGContext *s, int label_index, tcg_insn_unit *ptr)
     l->u.value_ptr = ptr;
 }
 
-int gen_new_label(TCGContext *s)
+TCGLabel *gen_new_label(TCGContext *s)
 {
-    int idx;
-    TCGLabel *l;
+    TCGLabel *l = tcg_malloc(s, sizeof(TCGLabel));
 
-    if (s->nb_labels >= TCG_MAX_LABELS)
-        tcg_abort();
-    idx = s->nb_labels++;
-    l = &s->labels[idx];
-    l->has_value = 0;
-    l->u.first_reloc = NULL;
-    return idx;
+    *l = (TCGLabel){
+        .id = s->nb_labels++
+    };
+
+    return l;
 }
 
 #include "tcg-target.c"
@@ -335,8 +333,8 @@ void tcg_context_init(TCGContext *s)
     s->nb_globals = 0;
 
     // copy original tcg_op_defs_org for private usage
-    s->tcg_op_defs = g_malloc(sizeof(tcg_op_defs_org));
-    memcpy(s->tcg_op_defs, tcg_op_defs_org, sizeof(tcg_op_defs_org));
+    s->tcg_op_defs = g_malloc(sizeof(tcg_op_defs));
+    memcpy(s->tcg_op_defs, tcg_op_defs, sizeof(tcg_op_defs));
 
     /* Count total number of arguments and allocate the corresponding
        space */
@@ -877,21 +875,6 @@ void tcg_gen_callN(TCGContext *s, void *func, TCGArg ret,
 #endif /* TCG_TARGET_EXTEND_ARGS */
 }
 
-// Unicorn engine
-// check if the last memory access was invalid
-// if so, we jump to the block epilogue to quit immediately.
-void check_exit_request(TCGContext *tcg_ctx)
-{
-    TCGv_i32 flag;
-
-    flag = tcg_temp_new_i32(tcg_ctx);
-    tcg_gen_ld_i32(tcg_ctx, flag, tcg_ctx->cpu_env,
-            offsetof(CPUState, tcg_exit_req) - ENV_OFFSET);
-    tcg_gen_brcondi_i32(tcg_ctx, TCG_COND_NE, flag, 0, tcg_ctx->exitreq_label);
-    tcg_temp_free_i32(tcg_ctx, flag);
-}
-
-
 static void tcg_reg_alloc_start(TCGContext *s)
 {
     int i;
@@ -1144,27 +1127,41 @@ void tcg_dump_ops(TCGContext *s)
 			case INDEX_op_qemu_st_i32:
 			case INDEX_op_qemu_ld_i64:
 			case INDEX_op_qemu_st_i64:
-				if (args[k] < ARRAY_SIZE(ldst_name) && ldst_name[args[k]]) {
-					qemu_log(",%s", ldst_name[args[k++]]);
+                {
+                    TCGMemOpIdx oi = args[k++];
+                    TCGMemOp op = get_memop(oi);
+                    unsigned ix = get_mmuidx(oi);
+                    if (op < ARRAY_SIZE(ldst_name) && ldst_name[op]) {
+                        qemu_log(",%s,%u", ldst_name[op], ix);
 				}
 				else {
-					qemu_log(",$0x%" TCG_PRIlx, args[k++]);
+                        qemu_log(",$0x%x,%u", op, ix);
 				}
 				i = 1;
+                }
 				break;
 			default:
 				i = 0;
 				break;
 			}
-			for (; i < nb_cargs; i++) {
-				if (k != 0) {
-					qemu_log(",");
-				}
-				qemu_log("$0x%" TCG_PRIlx, args[k++]);
-			}
-		}
-		qemu_log("\n");
-	}
+            switch (c) {
+            case INDEX_op_set_label:
+            case INDEX_op_br:
+            case INDEX_op_brcond_i32:
+            case INDEX_op_brcond_i64:
+            case INDEX_op_brcond2_i32:
+                qemu_log("%s$L%d", k ? "," : "", arg_label(args[k])->id);
+                i++, k++;
+                break;
+            default:
+                break;
+            }
+            for (; i < nb_cargs; i++, k++) {
+                qemu_log("%s$0x%" TCG_PRIlx, k ? "," : "", args[k]);
+            }
+        }
+        qemu_log("\n");
+    }
 }
 
 /* we give more priority to constraints with less registers */
@@ -1312,21 +1309,30 @@ void tcg_add_target_add_op_defs(TCGContext *s, const TCGTargetOpDef *tdefs)
 #endif
 }
 
-#ifdef USE_LIVENESS_ANALYSIS
-
-/* set a nop for an operation using 'nb_args' */
-static inline void tcg_set_nop(TCGContext *s, uint16_t *opc_ptr,
-                               TCGArg *args, int nb_args)
+void tcg_op_remove(TCGContext *s, TCGOp *op)
 {
-    if (nb_args == 0) {
-        *opc_ptr = INDEX_op_nop;
+    int next = op->next;
+    int prev = op->prev;
+
+    if (next >= 0) {
+        s->gen_op_buf[next].prev = prev;
     } else {
-        *opc_ptr = INDEX_op_nopn;
-        args[0] = nb_args;
-        args[nb_args - 1] = nb_args;
+        s->gen_last_op_idx = prev;
     }
+    if (prev >= 0) {
+        s->gen_op_buf[prev].next = next;
+    } else {
+        s->gen_first_op_idx = next;
+    }
+
+    memset(op, -1, sizeof(*op));
+
+#ifdef CONFIG_PROFILER
+    s->del_op_count++;
+#endif
 }
 
+#ifdef USE_LIVENESS_ANALYSIS
 /* liveness analysis: end of function: all temps are dead, and globals
    should be in memory. */
 static inline void tcg_la_func_end(TCGContext *s, uint8_t *dead_temps,
@@ -1345,18 +1351,6 @@ static inline void tcg_la_bb_end(TCGContext *s, uint8_t *dead_temps,
     int i;
 
     memset(dead_temps, 1, s->nb_temps);
-    memset(mem_temps, 1, s->nb_globals);
-    for(i = s->nb_globals; i < s->nb_temps; i++) {
-        mem_temps[i] = s->temps[i].temp_local;
-    }
-}
-
-/*
-    Unicorn: for brcond, we should refresh liveness states for TCG globals
-*/
-static inline void tcg_la_br_end(TCGContext *s, uint8_t *mem_temps)
-{
-    int i;
     memset(mem_temps, 1, s->nb_globals);
     for(i = s->nb_globals; i < s->nb_temps; i++) {
         mem_temps[i] = s->temps[i].temp_local;
@@ -1457,8 +1451,6 @@ static void tcg_liveness_analysis(TCGContext *s)
 		}
 		break;
 		case INDEX_op_debug_insn_start:
-		case INDEX_op_nop:
-		case INDEX_op_end:
 			break;
 		case INDEX_op_discard:
 			/* mark the temporary as dead */
@@ -1563,12 +1555,8 @@ static void tcg_liveness_analysis(TCGContext *s)
 					}
 				}
 			do_remove:
-				op->opc = INDEX_op_nop;
-#ifdef CONFIG_PROFILER
-				s->del_op_count++;
-#endif
-			}
-			else {
+                tcg_op_remove(s, op);
+            } else {
 			do_not_remove:
 				/* output args are dead */
 				dead_args = 0;
@@ -1949,7 +1937,6 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOpDef *def,
             ts->mem_coherent = 1;
         } else if (ts->val_type == TEMP_VAL_CONST) {
             tcg_out_movi(s, itype, ts->reg, ts->val);
-            ts->mem_coherent = 0;
         }
         s->reg_to_temp[ts->reg] = args[1];
         ts->val_type = TEMP_VAL_REG;
@@ -2319,13 +2306,21 @@ static void tcg_reg_alloc_call(TCGContext *s, int nb_oargs, int nb_iargs,
 
 #ifdef CONFIG_PROFILER
 
-static void dump_op_count(void)
+static int64_t tcg_table_op_count[NB_OPS];
+
+void tcg_dump_op_count(FILE *f, fprintf_function cpu_fprintf)
 {
     int i;
 
-    for(i = INDEX_op_end; i < NB_OPS; i++) {
-        qemu_log("%s %" PRId64 "\n", s->tcg_op_defs[i].name, tcg_table_op_count[i]);
+    for (i = 0; i < NB_OPS; i++) {
+        cpu_fprintf(f, "%s %" PRId64 "\n", tcg_op_defs[i].name,
+                    tcg_table_op_count[i]);
     }
+}
+#else
+void tcg_dump_op_count(FILE *f, fprintf_function cpu_fprintf)
+{
+    cpu_fprintf(f, "[TCG profiler not compiled]\n");
 }
 #endif
 
@@ -2401,16 +2396,13 @@ static inline int tcg_gen_code_common(TCGContext *s,
 			tcg_reg_alloc_movi(s, args, dead_args, sync_args);
             break;
         case INDEX_op_debug_insn_start:
-            /* debug instruction */
-            break;
-        case INDEX_op_nop:
             break;
         case INDEX_op_discard:
             temp_dead(s, args[0]);
             break;
         case INDEX_op_set_label:
             tcg_reg_alloc_bb_end(s, s->reserved_regs);
-            tcg_out_label(s, args[0], s->code_ptr);
+            tcg_out_label(s, arg_label(args[0]), s->code_ptr);
             break;
         case INDEX_op_call:
 			tcg_reg_alloc_call(s, op->callo, op->calli, args,
@@ -2485,7 +2477,6 @@ int tcg_gen_code_search_pc(TCGContext *s, tcg_insn_unit *gen_code_buf,
 #ifdef CONFIG_PROFILER
 void tcg_dump_info(FILE *f, fprintf_function cpu_fprintf)
 {
-#if 0
     TCGContext *s = &tcg_ctx;
     int64_t tot;
 
@@ -2527,9 +2518,6 @@ void tcg_dump_info(FILE *f, fprintf_function cpu_fprintf)
                 s->restore_count);
     cpu_fprintf(f, "  avg cycles        %0.1f\n",
                 s->restore_count ? (double)s->restore_time / s->restore_count : 0);
-
-    dump_op_count();
-#endif
 }
 #else
 void tcg_dump_info(FILE *f, fprintf_function cpu_fprintf)
