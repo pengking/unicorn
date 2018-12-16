@@ -1129,13 +1129,22 @@ void tcg_dump_ops(TCGContext *s)
                     TCGMemOpIdx oi = args[k++];
                     TCGMemOp op = get_memop(oi);
                     unsigned ix = get_mmuidx(oi);
-                    if (op < ARRAY_SIZE(ldst_name) && ldst_name[op]) {
-                        qemu_log(",%s,%u", ldst_name[op], ix);
-				}
-				else {
+
+                    if (op & ~(MO_AMASK | MO_BSWAP | MO_SSIZE)) {
                         qemu_log(",$0x%x,%u", op, ix);
-				}
-				i = 1;
+                    } else {
+                        const char *s_al = "", *s_op;
+                        if (op & MO_AMASK) {
+                            if ((op & MO_AMASK) == MO_ALIGN) {
+                                s_al = "al+";
+                            } else {
+                                s_al = "un+";
+                            }
+                        }
+                        s_op = ldst_name[op & (MO_BSWAP | MO_SSIZE)];
+                        qemu_log(",%s%s,%u", s_al, s_op, ix);
+                    }
+                    i = 1;
                 }
 				break;
 			default:
@@ -1404,8 +1413,7 @@ static void tcg_liveness_analysis(TCGContext *s)
 					}
 				}
 				goto do_remove;
-			}
-			else {
+                } else {
 			do_not_remove_call:
 
 				/* output args are dead */
@@ -1440,8 +1448,12 @@ static void tcg_liveness_analysis(TCGContext *s)
 						if (dead_temps[arg]) {
 							dead_args |= (1 << i);
 						}
-						dead_temps[arg] = 0;
+                        }
 					}
+                    /* input arguments are live for preceeding opcodes */
+                    for (i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
+                        arg = args[i];
+                        dead_temps[arg] = 0;
 				}
 				s->op_dead_args[oi] = dead_args;
 				s->op_sync_args[oi] = sync_args;
@@ -1521,21 +1533,19 @@ static void tcg_liveness_analysis(TCGContext *s)
 				op->opc = opc = opc_new;
 				args[1] = args[2];
 				args[2] = args[3];
-			}
-			else if (have_opc_new2 && dead_temps[args[0]]
-				&& !mem_temps[args[0]]) {
-				/* The low part of the operation is dead; generate the high. */
-				op->opc = opc = opc_new2;
-				args[0] = args[1];
-				args[1] = args[2];
-				args[2] = args[3];
-			}
-			else {
-				goto do_not_remove;
-			}
-			/* Mark the single-word operation live.  */
-			nb_oargs = 1;
-			goto do_not_remove;
+            } else if (have_opc_new2 && dead_temps[args[0]]
+                       && !mem_temps[args[0]]) {
+                /* The low part of the operation is dead; generate the high. */
+                op->opc = opc = opc_new2;
+                args[0] = args[1];
+                args[1] = args[2];
+                args[2] = args[3];
+            } else {
+                goto do_not_remove;
+            }
+            /* Mark the single-word operation live.  */
+            nb_oargs = 1;
+            goto do_not_remove;
 
 		default:
 			/* XXX: optimize by hardcoding common cases (e.g. triadic ops) */
@@ -1574,11 +1584,10 @@ static void tcg_liveness_analysis(TCGContext *s)
 				/* if end of basic block, update */
 				if (def->flags & TCG_OPF_BB_END) {
 					tcg_la_bb_end(s, dead_temps, mem_temps);
-				}
-				else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
-					/* globals should be synced to memory */
-					memset(mem_temps, 1, s->nb_globals);
-				}
+                } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
+                    /* globals should be synced to memory */
+                    memset(mem_temps, 1, s->nb_globals);
+                }
 
 				/* input args are live */
 				for (i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
@@ -1586,6 +1595,9 @@ static void tcg_liveness_analysis(TCGContext *s)
 					if (dead_temps[arg]) {
 						dead_args |= (1 << i);
 					}
+                }
+                for (i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
+                    arg = args[i];
 					dead_temps[arg] = 0;
 				}
 				s->op_dead_args[oi] = dead_args;
@@ -1935,6 +1947,7 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOpDef *def,
             ts->mem_coherent = 1;
         } else if (ts->val_type == TEMP_VAL_CONST) {
             tcg_out_movi(s, itype, ts->reg, ts->val);
+            ts->mem_coherent = 0;
         }
         s->reg_to_temp[ts->reg] = args[1];
         ts->val_type = TEMP_VAL_REG;
@@ -1961,6 +1974,9 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOpDef *def,
         }
         ots->val_type = TEMP_VAL_CONST;
         ots->val = ts->val;
+        if (IS_DEAD_ARG(1)) {
+            temp_dead(s, args[1]);
+        }
     } else {
         /* The code in the first if block should have moved the
            temp to a register. */
@@ -2055,6 +2071,14 @@ static void tcg_reg_alloc_op(TCGContext *s,
                    a new register and move it */
                 if (!IS_DEAD_ARG(i)) {
                     goto allocate_in_reg;
+                }
+                int k2, i2;
+                for (k2 = 0 ; k2 < k ; k2++) {
+                    i2 = def->sorted_args[nb_oargs + k2];
+                    if ((def->args_ct[i2].ct & TCG_CT_IALIAS) &&
+                        (new_args[i2] == ts->reg)) {
+                        goto allocate_in_reg;
+                    }
                 }
             }
         }

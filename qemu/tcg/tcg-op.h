@@ -259,7 +259,6 @@ static inline void tcg_gen_op6ii_i64(TCGContext *tcg_ctx,TCGOpcode opc, TCGv_i64
 
 /* Generic ops.  */
 
-TCGLabel * gen_new_label(TCGContext *tcg_ctx);
 
 static inline void gen_set_label(TCGContext *tcg_ctx,int n)
 {

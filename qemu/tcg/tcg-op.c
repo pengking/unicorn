@@ -292,6 +292,7 @@ void tcg_gen_brcondi_i32(TCGContext *tcg_ctx, TCGCond cond, TCGv_i32 arg1, int32
     TCGv_i32 t0 = tcg_const_i32(tcg_ctx, arg2);
     tcg_gen_brcond_i32(tcg_ctx, cond, arg1, t0, label);
     tcg_temp_free_i32(tcg_ctx, t0);
+    }
 }
 
 void tcg_gen_setcond_i32(TCGContext *tcg_ctx, TCGCond cond, TCGv_i32 ret,
@@ -964,6 +965,7 @@ void tcg_gen_ori_i64(TCGContext *tcg_ctx, TCGv_i64 ret, TCGv_i64 arg1, int64_t a
 #if TCG_TARGET_REG_BITS == 32
     tcg_gen_ori_i32(tcg_ctx, TCGV_LOW(ret), TCGV_LOW(arg1), arg2);
     tcg_gen_ori_i32(tcg_ctx, TCGV_HIGH(ret), TCGV_HIGH(arg1), arg2 >> 32);
+        return;
 #else
     /* Some cases can be optimized here.  */
     if (arg2 == -1) {
