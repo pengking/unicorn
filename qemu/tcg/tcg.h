@@ -32,6 +32,29 @@
 
 #include "uc_priv.h"
 
+ /* XXX: make safe guess about sizes */
+#define MAX_OP_PER_INSTR 266
+
+#if HOST_LONG_BITS == 32
+#define MAX_OPC_PARAM_PER_ARG 2
+#else
+#define MAX_OPC_PARAM_PER_ARG 1
+#endif
+#define MAX_OPC_PARAM_IARGS 5
+#define MAX_OPC_PARAM_OARGS 1
+#define MAX_OPC_PARAM_ARGS (MAX_OPC_PARAM_IARGS + MAX_OPC_PARAM_OARGS)
+
+ /* A Call op needs up to 4 + 2N parameters on 32-bit archs,
+ * and up to 4 + N parameters on 64-bit archs
+ * (N = number of input arguments + output arguments).  */
+#define MAX_OPC_PARAM (4 + (MAX_OPC_PARAM_PER_ARG * MAX_OPC_PARAM_ARGS))
+#define OPC_BUF_SIZE 640
+#define OPC_MAX_SIZE (OPC_BUF_SIZE - MAX_OP_PER_INSTR)
+
+#define OPPARAM_BUF_SIZE (OPC_BUF_SIZE * MAX_OPC_PARAM)
+
+#define CPU_TEMP_BUF_NLONGS 128
+
 /* Default target word size to pointer size.  */
 #ifndef TCG_TARGET_REG_BITS
 # if UINTPTR_MAX == UINT32_MAX
@@ -453,24 +476,33 @@ typedef struct TCGTempSet {
 } TCGTempSet;
 
 
+/* The layout here is designed to avoid a bitfield crossing of
+a 32-bit boundary, which would cause GCC to add extra padding.  */
 typedef struct TCGOp {
-	TCGOpcode opc : 8;
+	TCGOpcode opc : 8;        /*  8 */
 
-	/* The number of out and in parameter for a call.  */
-	unsigned callo : 2;
-	unsigned calli : 6;
+							  /* The number of out and in parameter for a call.  */
+	unsigned calli : 4;        /* 12 */
+	unsigned callo : 2;        /* 14 */
+	unsigned : 2;        /* 16 */
 
-	/* Index of the arguments for this op, or -1 for zero-operand ops.  */
-	signed args : 16;
+						 /* Index of the prev/next op, or 0 for the end of the list.  */
+	unsigned prev : 16;       /* 32 */
+	unsigned next : 16;       /* 48 */
 
-	/* Index of the prex/next op, or -1 for the end of the list.  */
-	signed prev : 16;
-	signed next : 16;
+							  /* Lifetime data of the operands.  */
+	unsigned life : 16;       /* 64 */
+
+							  /* Arguments for the opcode.  */
+	TCGArg args[MAX_OPC_PARAM];
 } TCGOp;
 
-QEMU_BUILD_BUG_ON(NB_OPS > 0xff);
-QEMU_BUILD_BUG_ON(OPC_BUF_SIZE >= 0x7fff);
-QEMU_BUILD_BUG_ON(OPPARAM_BUF_SIZE >= 0x7fff);
+/* Make sure that we don't expand the structure without noticing.  */
+QEMU_BUILD_BUG_ON(sizeof(TCGOp) != 8 + sizeof(TCGArg) * MAX_OPC_PARAM);
+
+/* Make sure operands fit in the bitfields above.  */
+QEMU_BUILD_BUG_ON(NB_OPS > (1 << 8));
+QEMU_BUILD_BUG_ON(OPC_BUF_SIZE > (1 << 16));
 
 /* pool based memory allocation */
 
@@ -647,7 +679,6 @@ struct TCGContext {
 	int gen_first_op_idx;
 	int gen_last_op_idx;
 	int gen_next_op_idx;
-	int gen_next_parm_idx;
 
 
     /* Code generation.  Note that we specifically do not use tcg_insn_unit
@@ -675,7 +706,6 @@ struct TCGContext {
 	int reg_to_temp[TCG_TARGET_NB_REGS];
 
 	TCGOp gen_op_buf[OPC_BUF_SIZE];
-	TCGArg gen_opparam_buf[OPPARAM_BUF_SIZE];
 
 	target_ulong gen_opc_pc[OPC_BUF_SIZE];
 	uint16_t gen_opc_icount[OPC_BUF_SIZE];
@@ -788,6 +818,11 @@ struct TCGContext {
 
     int exitreq_label;  // gen_tb_start()
 };
+
+static inline void tcg_set_insn_param(TCGContext *tcg_ctx, int op_idx, int arg, TCGArg v)
+{
+	tcg_ctx->gen_op_buf[op_idx].args[arg] = v;
+}
 
 typedef struct TCGTargetOpDef {
     TCGOpcode op;
